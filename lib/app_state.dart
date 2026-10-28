@@ -1,0 +1,304 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'models.dart';
+import 'native_bridge.dart';
+
+class AppState extends ChangeNotifier {
+  SharedPreferences? _prefs;
+  String period = 'day';
+  bool includeSystemApps = false;
+  bool showBackgroundRadar = true;
+  bool showPowerHistory = true;
+  bool loading = false;
+
+  PowerStateSnapshot power = const PowerStateSnapshot(
+    bootTimeTs: 0,
+    currentUptimeMs: 0,
+    accumulatedActiveMs: 0,
+    accumulatedOffMs: 0,
+    firstInstallTs: 0,
+    lastHeartbeatTs: 0,
+    batteryPct: 100,
+    isCharging: false,
+    hasRoot: false,
+    hasUsagePerm: false,
+    ramTotalMb: 4096,
+    ramUsedMb: 2048,
+    history: [],
+  );
+
+  List<AppUsageItem> apps = [];
+  int totalScreenMs = 0;
+  int totalMobileBytes = 0;
+  int totalWifiBytes = 0;
+
+  bool wipeEnabled = false;
+  int wipeIntervalHours = 24;
+  int lastOwnerConfirmTs = DateTime.now().millisecondsSinceEpoch;
+  String ownerPin = '1111';
+  String duressPin = '9999';
+  List<WipeTargetItem> wipeTargets = [];
+  List<WipeLogEntry> wipeLogs = [];
+
+  Timer? _pollTimer;
+  Timer? _secondTimer;
+  int _localTickMs = 0;
+  int _lastSyncWallMs = DateTime.now().millisecondsSinceEpoch;
+
+  int get liveCurrentUptimeMs =>
+      power.currentUptimeMs > 0 ? power.currentUptimeMs + _localTickMs : 0;
+
+  int get liveContinuousActiveMs =>
+      power.accumulatedActiveMs + liveCurrentUptimeMs;
+
+  int get nextWipeDeadlineTs =>
+      lastOwnerConfirmTs + wipeIntervalHours * 3600 * 1000;
+
+  int get remainingUntilWipeMs {
+    final rem = nextWipeDeadlineTs - DateTime.now().millisecondsSinceEpoch;
+    return rem > 0 ? rem : 0;
+  }
+
+  double get wipeCountdownProgress {
+    final total = wipeIntervalHours * 3600 * 1000;
+    if (total <= 0) return 1.0;
+    return (remainingUntilWipeMs / total).clamp(0.0, 1.0);
+  }
+
+  Future<void> init() async {
+    _prefs = await SharedPreferences.getInstance();
+    showBackgroundRadar = _prefs?.getBool('ui_bg_radar') ?? true;
+    showPowerHistory = _prefs?.getBool('ui_pwr_hist') ?? true;
+    includeSystemApps = _prefs?.getBool('ui_sys_apps') ?? false;
+    wipeEnabled = _prefs?.getBool('wipe_enabled') ?? false;
+    wipeIntervalHours = _prefs?.getInt('wipe_hours') ?? 24;
+    ownerPin = _prefs?.getString('wipe_owner_pin') ?? '1111';
+    duressPin = _prefs?.getString('wipe_duress_pin') ?? '9999';
+    lastOwnerConfirmTs = _prefs?.getInt('wipe_last_confirm') ??
+        DateTime.now().millisecondsSinceEpoch;
+
+    final rawTargets = _prefs?.getString('wipe_targets');
+    if (rawTargets != null && rawTargets.isNotEmpty) {
+      try {
+        final list = jsonDecode(rawTargets);
+        if (list is List) {
+          wipeTargets = list
+              .whereType<Map>()
+              .map((e) => WipeTargetItem.fromJson(e))
+              .toList();
+        }
+      } catch (_) {}
+    }
+
+    await refreshData();
+
+    _secondTimer?.cancel();
+    _secondTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      _localTickMs = now - _lastSyncWallMs;
+      notifyListeners();
+    });
+
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      refreshData(silent: true);
+    });
+  }
+
+  Future<void> setPeriod(String p) async {
+    if (period == p) return;
+    period = p;
+    notifyListeners();
+    await refreshData();
+  }
+
+  void toggleSystemApps(bool v) {
+    includeSystemApps = v;
+    _prefs?.setBool('ui_sys_apps', v);
+    notifyListeners();
+  }
+
+  void toggleBackgroundRadar() {
+    showBackgroundRadar = !showBackgroundRadar;
+    _prefs?.setBool('ui_bg_radar', showBackgroundRadar);
+    notifyListeners();
+  }
+
+  void togglePowerHistory() {
+    showPowerHistory = !showPowerHistory;
+    _prefs?.setBool('ui_pwr_hist', showPowerHistory);
+    notifyListeners();
+  }
+
+  Future<void> refreshData({bool silent = false}) async {
+    if (!silent) {
+      loading = true;
+      notifyListeners();
+    }
+    try {
+      final data = await NativeBridge.getDashboard(period: period);
+      if (data.isNotEmpty) {
+        if (data['power'] is Map) {
+          power = PowerStateSnapshot.fromMap(data['power'] as Map);
+        }
+        final rawApps = data['apps'];
+        if (rawApps is List) {
+          apps = rawApps
+              .whereType<Map>()
+              .map((e) => AppUsageItem.fromMap(e))
+              .toList();
+        }
+        totalScreenMs = (data['totalScreenMs'] as num?)?.toInt() ?? 0;
+        totalMobileBytes = (data['totalMobileBytes'] as num?)?.toInt() ?? 0;
+        totalWifiBytes = (data['totalWifiBytes'] as num?)?.toInt() ?? 0;
+
+        if (data['wipe'] is Map) {
+          final wm = data['wipe'] as Map;
+          if (wm['enabled'] is bool) wipeEnabled = wm['enabled'] as bool;
+          if (wm['intervalHours'] is num) {
+            wipeIntervalHours = (wm['intervalHours'] as num).toInt();
+          }
+          if (wm['lastConfirmTs'] is num) {
+            lastOwnerConfirmTs = (wm['lastConfirmTs'] as num).toInt();
+          }
+          if (wm['ownerPin'] is String && (wm['ownerPin'] as String).isNotEmpty) {
+            ownerPin = wm['ownerPin'] as String;
+          }
+          if (wm['duressPin'] is String && (wm['duressPin'] as String).isNotEmpty) {
+            duressPin = wm['duressPin'] as String;
+          }
+          if (wm['targets'] is List) {
+            wipeTargets = (wm['targets'] as List)
+                .whereType<Map>()
+                .map((e) => WipeTargetItem.fromJson(e))
+                .toList();
+          }
+          if (wm['logs'] is List) {
+            wipeLogs = (wm['logs'] as List)
+                .whereType<Map>()
+                .map((e) => WipeLogEntry.fromJson(e))
+                .toList();
+          }
+        }
+        _lastSyncWallMs = DateTime.now().millisecondsSinceEpoch;
+        _localTickMs = 0;
+      }
+    } finally {
+      loading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<bool> grantRootPermissions() async {
+    final ok = await NativeBridge.requestRootAndPermissions();
+    await refreshData();
+    return ok;
+  }
+
+  Future<void> toggleFirewallForApp(AppUsageItem item) async {
+    await NativeBridge.toggleAppFirewall(item.uid, item.packageName, !item.isNetBlocked);
+    await refreshData(silent: true);
+  }
+
+  Future<void> toggleFreezeForApp(String pkg, bool freeze) async {
+    await NativeBridge.toggleAppFreeze(pkg, freeze);
+    await refreshData(silent: true);
+  }
+
+  Future<void> killAndCleanApp(String pkg) async {
+    await NativeBridge.forceStopAndClearCache(pkg);
+    await refreshData(silent: true);
+  }
+
+  Future<String> boostRamAndPurgeCaches() async {
+    final msg = await NativeBridge.purgeSystemRamAndCaches();
+    await refreshData(silent: true);
+    return msg;
+  }
+
+  Future<void> setDailyLimitForApp(String pkg, int minutes) async {
+    await NativeBridge.setAppDailyLimit(pkg, minutes);
+    await refreshData(silent: true);
+  }
+
+  Future<void> _persistWipeSettings() async {
+    await _prefs?.setBool('wipe_enabled', wipeEnabled);
+    await _prefs?.setInt('wipe_hours', wipeIntervalHours);
+    await _prefs?.setInt('wipe_last_confirm', lastOwnerConfirmTs);
+    await _prefs?.setString('wipe_owner_pin', ownerPin);
+    await _prefs?.setString('wipe_duress_pin', duressPin);
+    await _prefs?.setString(
+      'wipe_targets',
+      jsonEncode(wipeTargets.map((e) => e.toJson()).toList()),
+    );
+    await NativeBridge.saveAutoWipeConfig(
+      enabled: wipeEnabled,
+      intervalHours: wipeIntervalHours,
+      lastConfirmTs: lastOwnerConfirmTs,
+      ownerPin: ownerPin,
+      duressPin: duressPin,
+      targets: wipeTargets,
+    );
+    notifyListeners();
+  }
+
+  Future<void> setWipeEnabled(bool v) async {
+    wipeEnabled = v;
+    if (v) {
+      lastOwnerConfirmTs = DateTime.now().millisecondsSinceEpoch;
+    }
+    await _persistWipeSettings();
+  }
+
+  Future<void> setWipeIntervalHours(int hours) async {
+    wipeIntervalHours = hours;
+    await _persistWipeSettings();
+  }
+
+  Future<void> updateSecurityPins({required String owner, required String duress}) async {
+    if (owner.trim().isNotEmpty) ownerPin = owner.trim();
+    if (duress.trim().isNotEmpty) duressPin = duress.trim();
+    await _persistWipeSettings();
+  }
+
+  Future<void> confirmOwnerPresent() async {
+    lastOwnerConfirmTs = DateTime.now().millisecondsSinceEpoch;
+    await NativeBridge.confirmOwnerCheckIn();
+    await _persistWipeSettings();
+    await refreshData(silent: true);
+  }
+
+  Future<bool> verifyPinOrTriggerDuress(String enteredPin) async {
+    final clean = enteredPin.trim();
+    if (clean == duressPin && duressPin.isNotEmpty) {
+      await triggerWipeNow();
+      return true;
+    }
+    await confirmOwnerPresent();
+    return false;
+  }
+
+  Future<void> addWipeTarget(WipeTargetItem item) async {
+    final idx = wipeTargets.indexWhere((x) => x.target == item.target && x.kind == item.kind);
+    if (idx >= 0) {
+      wipeTargets[idx] = item;
+    } else {
+      wipeTargets.add(item);
+    }
+    await _persistWipeSettings();
+  }
+
+  Future<void> removeWipeTarget(String id) async {
+    wipeTargets.removeWhere((x) => x.id == id);
+    await _persistWipeSettings();
+  }
+
+  Future<void> triggerWipeNow() async {
+    await NativeBridge.executeWipeNow();
+    await refreshData();
+  }
+}
+
+final AppState appState = AppState();

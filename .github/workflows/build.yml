@@ -1,0 +1,114 @@
+name: Build SentinelRoot APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-sentinelroot-v1
+
+      - name: Flutter create android platform if missing
+        run: |
+          cp pubspec.yaml /tmp/pubspec.yaml.bak
+          cp lib/main.dart /tmp/main.dart.bak
+          if [ ! -f android/app/src/main/AndroidManifest.xml ]; then
+            flutter create --org com.sentinel --project-name sentinelroot --platforms android .
+          fi
+          cp /tmp/pubspec.yaml.bak pubspec.yaml
+          cp /tmp/main.dart.bak lib/main.dart
+          rm -f test/widget_test.dart
+          mkdir -p assets/icon
+          touch assets/icon/.keep
+
+      - name: Generate release keystore
+        run: |
+          if [ ! -f android/app/sentinel-release.jks ]; then
+            keytool -genkeypair -v -keystore android/app/sentinel-release.jks -storetype JKS -keyalg RSA -keysize 2048 -validity 10000 -alias sentinel -storepass sentinel123 -keypass sentinel123 -dname "CN=SentinelRoot, OU=Security, O=Sentinel, L=Dushanbe, ST=TJ, C=TJ"
+          fi
+          printf 'storePassword=sentinel123\nkeyPassword=sentinel123\nkeyAlias=sentinel\nstoreFile=sentinel-release.jks\n' > android/key.properties
+
+      - name: Patch Android native code & manifest
+        run: bash tool/patch_android.sh
+
+      - name: Generate app icon
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick
+          bash tool/make_icon.sh
+
+      - name: Bump build number
+        run: |
+          sed -i "s/^version: .*/version: 5.0.${{ github.run_number }}+${{ github.run_number }}/" pubspec.yaml
+
+      - name: Flutter pub get & unit tests
+        run: |
+          rm -f test/widget_test.dart
+          flutter pub get
+          flutter test test/domain_test.dart
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Prepare APK and SHA256
+        run: |
+          mkdir -p out
+          cp build/app/outputs/flutter-apk/app-release.apk "out/SentinelRoot-v5.0.${{ github.run_number }}.apk"
+          cd out
+          sha256sum *.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          {
+            echo "SentinelRoot v5.0.${{ github.run_number }} (Obsidian Command HUD Edition)"
+            echo "- Новый тактический дизайн с нуля (круговые диаграммы, HUD-панель, плавающий док)"
+            echo "- Учёт времени использования приложений (Сутки / Месяц / Год)"
+            echo "- Радар скрытой фоновой активности + Root-Брандмауэр (iptables)"
+            echo "- Монитор ОЗУ (/proc/meminfo) + Root-очистка кэша и сброс буферов памяти"
+            echo "- Встроенный Root-проводник, выбор любых приложений и Duress PIN автоудаление"
+          } > NOTES.md
+
+      - name: Upload APK to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SentinelRoot-apk
+          path: out/*.apk
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v5.0.${{ github.run_number }}
+          name: SentinelRoot v5.0.${{ github.run_number }}
+          body_path: out/NOTES.md
+          files: |
+            out/*.apk
+            out/SHA256SUMS.txt
+          make_latest: true
